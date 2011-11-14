@@ -370,19 +370,41 @@ class SiteTreeSubsites extends SiteTreeDecorator {
 				$withoutHttp = substr($link, strlen('http://'));
 				if(strpos($withoutHttp, '/') && strpos($withoutHttp, '/') < strlen($withoutHttp)) {
 					$domain = substr($withoutHttp, 0, strpos($withoutHttp, '/'));
-					$rest = substr($withoutHttp, strpos($withoutHttp, '/') + 1);
-					
-					$subsiteID = Subsite::getSubsiteIDForDomain($domain);
-					if($subsiteID == 0) continue; // We have no idea what the domain for the main site is, so cant track links to it
+					$subsiteID = Subsite::getSubsiteIDForDomain($domain, false);
+					if($subsiteID === false) {
+						continue; // We have no idea what the domain for the main site is, so cant track links to it
+					}
+					$rest = substr(parse_url($link, PHP_URL_PATH), 1);
+					$parts = Convert::raw2sql(preg_split('|/+|', $rest));
+					$segment = array_shift($parts);
 					
 					Subsite::disable_subsite_filter(true);
-					$candidatePage = DataObject::get_one("SiteTree", "\"URLSegment\" = '" . urldecode( $rest). "' AND \"SubsiteID\" = " . $subsiteID, false);
+					Translatable::disable_locale_filter();
+
+					if ($segment == "") {
+						$homepage = DataObject::get_one('SiteTree', "HomepageForDomain LIKE '%".$domain.".%' AND \"SubsiteID\" = ".$subsiteID);
+						$segment  = $homepage ? $homepage->URLSegment : "home";
+					}
+					$candidatePage = DataObject::get_one("SiteTree", "\"URLSegment\" = '" . $segment . "' AND \"ParentID\" = 0 AND \"SubsiteID\" = " . $subsiteID, false);
+					if($candidatePage) {
+						foreach($parts as $segment) {
+							if ($segment == "") continue;
+							$next = DataObject::get_one("SiteTree", "\"URLSegment\" = '" . $segment . "' AND \"ParentID\" = ".$candidatePage->ID." AND \"SubsiteID\" = " . $subsiteID, false);
+							if(!$next) {
+								$candidatePage=null;
+								break;
+							}
+							$candidatePage = $next;
+						}
+					}
+					Translatable::enable_locale_filter();
 					Subsite::disable_subsite_filter(false);
 					
 					if($candidatePage) {
 						$linkedPages[] = $candidatePage->ID;
 					} else {
 						$this->owner->HasBrokenLink = true;
+//SS_Log::log(new Exception("page ".$this->owner->URLSegment." ".$this->owner->ID." broken link $link - tried to match $rest on subsiteID $subsiteID"), SS_Log::NOTICE);
 					}
 				}
 			}

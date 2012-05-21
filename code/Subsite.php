@@ -20,6 +20,7 @@ class Subsite extends DataObject implements PermissionProvider {
 	static $force_subsite = null;
 
 	static $write_hostmap = true;
+	
 	static $default_sort = "\"Title\" ASC";
 
 	static $db = array(
@@ -31,7 +32,10 @@ class Subsite extends DataObject implements PermissionProvider {
 
 		// Used to hide unfinished/private subsites from public view.
 		// If unset, will default to true
-		'IsPublic' => 'Boolean'
+		'IsPublic' => 'Boolean',
+		
+		// Comma-separated list of disallowed page types
+		'PageTypeBlacklist' => 'Text',
 	);
 	
 	static $has_one = array(
@@ -66,6 +70,11 @@ class Subsite extends DataObject implements PermissionProvider {
 		'PrimaryDomain' => 'Primary Domain',
 		'IsPublic' => 'Active subsite',
 	);
+	
+	/**
+	 * Memory cache of accessible sites
+	 */
+	private static $_cache_accessible_sites = array();
 
 	/**
 	 * @var array $allowed_themes Numeric array of all themes which are allowed to be selected for all subsites.
@@ -73,6 +82,13 @@ class Subsite extends DataObject implements PermissionProvider {
 	 * are listed.
 	 */
 	protected static $allowed_themes = array();
+	
+	/**
+	 * @var Boolean If set to TRUE, don't assume 'www.example.com' and 'example.com' are the same.
+	 * Doesn't affect wildcard matching, so '*.example.com' will match 'www.example.com' (but not 'example.com')
+	 * in both TRUE or FALSE setting.
+	 */
+	static $strict_subdomain_matching = false;
 
 	static function set_allowed_domains($domain){
 		user_error('Subsite::set_allowed_domains() is deprecated; it is no longer necessary '
@@ -118,24 +134,29 @@ class Subsite extends DataObject implements PermissionProvider {
 	 */
 	public function onAfterWrite() {
 		Subsite::writeHostMap();
+		parent::onAfterWrite();
 	}
 	
 	/**
-	 * Return the domain of this site
-	 *
+	 * Return the primary domain of this site. Tries to "normalize" the domain name,
+	 * by replacing potential wildcards.
+	 * 
 	 * @return string The full domain name of this subsite (without protocol prefix)
 	 */
 	function domain() {
 		if($this->ID) {
-			$domains = DataObject::get("SubsiteDomain", "\"SubsiteID\" = $this->ID", "\"IsPrimary\" DESC",
-				"", 1);
+			$domains = DataObject::get("SubsiteDomain", "\"SubsiteID\" = $this->ID", "\"IsPrimary\" DESC","", 1);
 			if($domains) {
 				$domain = $domains->First()->Domain;
 				// If there are wildcards in the primary domain (not recommended), make some
-				// educated guesses about what to replace them with
-				$domain = preg_replace("/\\.\\*\$/",".$_SERVER[HTTP_HOST]", $domain);
-				$domain = preg_replace("/^\\*\\./","subsite.", $domain);
+				// educated guesses about what to replace them with:
+				$domain = preg_replace('/\.\*$/',".$_SERVER[HTTP_HOST]", $domain);
+				// Default to "subsite." prefix for first wildcard
+				// TODO Whats the significance of "subsite" in this context?!
+				$domain = preg_replace('/^\*\./',"subsite.", $domain);
+				// *Only* removes "intermediate" subdomains, so 'subdomain.www.domain.com' becomes 'subdomain.domain.com'
 				$domain = str_replace('.www.','.', $domain);
+				
 				return $domain;
 			}
 			
@@ -158,11 +179,18 @@ class Subsite extends DataObject implements PermissionProvider {
 	 */
 	function getCMSFields() {
 		$domainTable = new TableField("Domains", "SubsiteDomain", 
-			array("Domain" => "Domain (use * as a wildcard)", "IsPrimary" => "Primary domain?"), 
+			array("Domain" => "Domain <small>(use * as a wildcard)</small>", "IsPrimary" => "Primary domain?"), 
 			array("Domain" => "TextField", "IsPrimary" => "CheckboxField"), 
 			"SubsiteID", $this->ID);
 			
 		$languageSelector = new DropdownField('Language', 'Language', i18n::get_common_locales());
+		
+		$pageTypeMap = array();
+		$pageTypes = SiteTree::page_type_classes();
+		foreach($pageTypes as $pageType) {
+			$pageTypeMap[$pageType] = singleton($pageType)->i18n_singular_name();
+		}
+		asort($pageTypeMap);
 
 		$fields = new FieldSet(
 			new TabSet('Root',
@@ -177,7 +205,21 @@ class Subsite extends DataObject implements PermissionProvider {
 					new CheckboxField('DefaultSite', 'Default site', $this->DefaultSite),
 					new CheckboxField('IsPublic', 'Enable public access', $this->IsPublic),
 
-					new DropdownField('Theme','Theme', $this->allowedThemes(), $this->Theme)
+					new DropdownField('Theme','Theme', $this->allowedThemes(), $this->Theme),
+					
+					
+					new LiteralField(
+						'PageTypeBlacklistToggle',
+						sprintf(
+							'<div class="field"><a href="#" id="PageTypeBlacklistToggle">%s</a></div>',
+							_t('Subsite.PageTypeBlacklistField', 'Disallow page types?')
+						)
+					),
+					new CheckboxSetField(
+						'PageTypeBlacklist', 
+						false,
+						$pageTypeMap
+					)
 				)
 			),
 			new HiddenField('ID', '', $this->ID),
@@ -285,16 +327,17 @@ JS;
 
 	/**
 	 * Get a matching subsite for the given host, or for the current HTTP_HOST.
+	 * Supports "fuzzy" matching of domains by placing an asterisk at the start of end of the string,
+	 * for example matching all subdomains on *.example.com with one subsite,
+	 * and all subdomains on *.example.org on another.
 	 * 
-	 * @param $host The host to find the subsite for.  If not specified, $_SERVER['HTTP_HOST']
-	 * is used.
-	 *
+	 * @param $host The host to find the subsite for.  If not specified, $_SERVER['HTTP_HOST'] is used.
 	 * @return int Subsite ID
 	 */
 	static function getSubsiteIDForDomain($host = null, $returnMainIfNotFound = true) {
 		if($host == null) $host = $_SERVER['HTTP_HOST'];
 		
-		$host = str_replace('www.','',$host);
+		if(!Subsite::$strict_subdomain_matching) $host = preg_replace('/^www\./', '', $host);
 		$SQL_host = Convert::raw2sql($host);
 
 		$matchingDomains = DataObject::get("SubsiteDomain", "'$SQL_host' LIKE replace(\"SubsiteDomain\".\"Domain\",'*','%')",
@@ -303,7 +346,15 @@ JS;
 		
 		if($matchingDomains) {
 			$subsiteIDs = array_unique($matchingDomains->column('SubsiteID'));
-			if(sizeof($subsiteIDs) > 1) user_error("Multiple subsites match '$host'", E_USER_WARNING);
+			$subsiteDomains = array_unique($matchingDomains->column('Domain'));
+			if(sizeof($subsiteIDs) > 1) {
+				throw new UnexpectedValueException(sprintf(
+					"Multiple subsites match on '%s': %s",
+					$host,
+					implode(',', $subsiteDomains)
+				));
+			}
+			
 			return $subsiteIDs[0];
 		}
 		
@@ -337,6 +388,19 @@ JS;
 	
 	}
 
+	/**
+	 * Checks if a member can be granted certain permissions, regardless of the subsite context.
+	 * Similar logic to {@link Permission::checkMember()}, but only returns TRUE
+	 * if the member is part of a group with the "AccessAllSubsites" flag set.
+	 * If more than one permission is passed to the method, at least one of them must
+	 * be granted for if to return TRUE.
+	 * 
+	 * @todo Allow permission inheritance through group hierarchy.
+	 * 
+	 * @param Member Member to check against. Defaults to currently logged in member
+	 * @param Array Permission code strings. Defaults to "ADMIN".
+	 * @return boolean
+	 */
 	static function hasMainSitePermission($member = null, $permissionCodes = array('ADMIN')) {
 		if(!is_array($permissionCodes))
 			user_error('Permissions must be passed to Subsite::hasMainSitePermission as an array', E_USER_ERROR);
@@ -411,6 +475,8 @@ JS;
 	 * @param $permCode array|string Either a single permission code or an array of permission codes.
 	 * @param $includeMainSite If true, the main site will be included if appropriate.
 	 * @param $mainSiteTitle The label to give to the main site
+	 * @param $member
+	 * @return DataObjectSet of {@link Subsite} instances
 	 */
 	function accessible_sites($permCode, $includeMainSite = false, $mainSiteTitle = "Main site", $member = null) {
 		// Rationalise member arguments
@@ -418,8 +484,15 @@ JS;
 		if(!$member) return new DataObjectSet();
 		if(!is_object($member)) $member = DataObject::get_by_id('Member', $member);
 
+		// Rationalise permCode argument 
 		if(is_array($permCode))	$SQL_codes = "'" . implode("', '", Convert::raw2sql($permCode)) . "'";
 		else $SQL_codes = "'" . Convert::raw2sql($permCode) . "'";
+		
+		// Cache handling
+		$cacheKey = $SQL_codes . '-' . $member->ID . '-' . $includeMainSite . '-' . $mainSiteTitle;
+		if(isset(self::$_cache_accessible_sites[$cacheKey])) {
+			return self::$_cache_accessible_sites[$cacheKey];
+		}
 
 		$templateClassList = "'" . implode("', '", ClassInfo::subclassesFor("Subsite_Template")) . "'";
 
@@ -438,6 +511,7 @@ JS;
 				ON \"Group\".\"ID\"=\"Permission\".\"GroupID\"
 				AND \"Permission\".\"Code\" IN ($SQL_codes, 'ADMIN')"
 		);
+		if(!$subsites) $subsites = new DataObjectSet();
 
 		$rolesSubsites = DataObject::get(
 			'Subsite',
@@ -477,6 +551,8 @@ JS;
 				$subsites->insertFirst($mainSite);
 			}
 		}
+		
+		self::$_cache_accessible_sites[$cacheKey] = $subsites;
 
 		return $subsites;
 	}
@@ -499,7 +575,9 @@ JS;
 		if ($subsites) foreach($subsites as $subsite) {
 			$domains = $subsite->Domains();
 			if ($domains) foreach($domains as $domain) {
-				$hostmap[str_replace('www.', '', $domain->Domain)] = $subsite->domain(); 
+				$domainStr = $domain->Domain;
+				if(!Subsite::$strict_subdomain_matching) $domainStr = preg_replace('/^www\./', '', $domainStr);
+				$hostmap[$domainStr] = $subsite->domain(); 
 			}
 			if ($subsite->DefaultSite) $hostmap['default'] = $subsite->domain();
 		}
@@ -554,6 +632,13 @@ JS;
 	 */
 	static function disable_subsite_filter($disabled = true) {
 		self::$disable_subsite_filter = $disabled;
+	}
+	
+	/**
+	 * Flush caches on database reset
+	 */
+	static function on_db_reset() {
+		self::$_cache_accessible_sites = array();
 	}
 }
 

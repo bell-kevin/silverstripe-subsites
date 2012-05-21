@@ -5,14 +5,21 @@
  * @package subsites
  */
 class LeftAndMainSubsites extends Extension {
-	static $allowed_actions = array(
-		'changesubsite',
-	);
-	
+
 	function init() {
 		Requirements::css('subsites/css/LeftAndMain_Subsites.css');
 		Requirements::javascript('subsites/javascript/LeftAndMain_Subsites.js');
 		Requirements::javascript('subsites/javascript/VirtualPage_Subsites.js');
+		
+		if(isset($_REQUEST['SubsiteID'])) {
+			// Clear current page when subsite changes (or is set for the first time)
+			if(!Session::get('SubsiteID') || $_REQUEST['SubsiteID'] != Session::get('SubsiteID')) {
+				Session::clear("{$this->owner->class}.currentPage");
+			}
+			
+			// Update current subsite in session
+			Subsite::changeSubsite($_REQUEST['SubsiteID']);
+		}
 	}
 	
 	/**
@@ -20,29 +27,11 @@ class LeftAndMainSubsites extends Extension {
 	 */
 	function getCMSTreeTitle() {
 		$subsite = Subsite::currentSubSite();
-		return $subsite ? htmlspecialchars($subsite->Title, ENT_QUOTES) : 'Site Content';
+		return $subsite ? Convert::raw2xml($subsite->Title) : _t('LeftAndMain.SITECONTENTLEFT');
 	}
 	
 	function updatePageOptions(&$fields) {
 		$fields->push(new HiddenField('SubsiteID', 'SubsiteID', Subsite::currentSubsiteID()));
-	}
-
-
-	public function changesubsite() {
-		$id = $_REQUEST['SubsiteID'];
-
-		Subsite::changeSubsite($id==-1 ? 0 : $id);
-		
-		if ($id == '-1') Cookie::set('noSubsiteFilter', 'true', 1);
-		else Cookie::set('noSubsiteFilter', 'false', 1);
-		
-		if(Director::is_ajax()) {
-			$tree = $this->owner->SiteTreeAsUL();
-			$tree = ereg_replace('^[ \t\r\n]*<ul[^>]*>','', $tree);
-			$tree = ereg_replace('</ul[^>]*>[ \t\r\n]*$','', $tree);
-			return $tree;
-		} else
-			return array();
 	}
 	
 	public function Subsites() {
@@ -83,6 +72,17 @@ class LeftAndMainSubsites extends Extension {
 			}
 		}
 		
+		// Whitelist for admin sections which are subsite aware.
+		// For example, don't show subsite list in reports section, it doesn't have
+		// any effect there - subsites are filtered through a custom dropdown there, see SubsiteReportWrapper.
+		if(!(
+			$this->owner instanceof AssetAdmin 
+			|| $this->owner instanceof SecurityAdmin 
+			|| $this->owner instanceof CMSMain)
+		) {
+			return false;
+		}
+		
 		$list = $this->Subsites();
 		
 		$currentSubsiteID = Subsite::currentSubsiteID();
@@ -93,7 +93,7 @@ class LeftAndMainSubsites extends Extension {
 			foreach($list as $subsite) {
 				$selected = $subsite->ID == $currentSubsiteID ? ' selected="selected"' : '';
 		
-				$output .= "\n<option value=\"{$subsite->ID}\"$selected>".htmlspecialchars($subsite->Title, ENT_QUOTES)."</option>";
+				$output .= "\n<option value=\"{$subsite->ID}\"$selected>". Convert::raw2xml($subsite->Title) . "</option>";
 			}
 		
 			$output .= '</select>';
